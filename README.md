@@ -2,6 +2,8 @@
 
 **Verify-then-Extract**：声纹判断 CMD 是否存在该说话人；**仅「人不在」时拒识**；在场则按所选方案提取目标语音。
 
+**ASR 全量流探测** [`asr_probe/`](asr_probe/README.md)（pos+neg × mix/d1/d2，不做拒识）。
+
 ## 口径
 
 | 项 | 约定 |
