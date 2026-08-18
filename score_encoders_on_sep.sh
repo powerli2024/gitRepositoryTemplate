@@ -86,14 +86,18 @@ ARGS+=(--spk-chs-dir "$SPK_CHS_DIR")
 
 "$PYTHON_BIN" "$ROOT/scripts/score_encoders_on_sep.py" "${ARGS[@]}"
 
-echo
-echo "=== fuse sweep (offline optimal) ==="
-"$PYTHON_BIN" "$ROOT/scripts/sweep_encoder_fuse.py" \
-  --reports-dir "$OUT/reports" \
-  --out "$OUT/reports/fuse_best_offline.json" \
-  --arms "$ARMS"
+if [[ "${SKIP_FUSE:-0}" == "1" ]]; then
+  echo "[INFO] SKIP_FUSE=1，跳过 sweep_encoder_fuse"
+else
+  echo
+  echo "=== fuse sweep (offline optimal) ==="
+  "$PYTHON_BIN" "$ROOT/scripts/sweep_encoder_fuse.py" \
+    --reports-dir "$OUT/reports" \
+    --out "$OUT/reports/fuse_best_offline.json" \
+    --arms "$ARMS"
+  echo "融合最优: $OUT/reports/fuse_best_offline.md"
+fi
 
 echo
 echo "报告: $OUT/reports/encoder_sep_matrix.md"
-echo "融合最优: $OUT/reports/fuse_best_offline.md"
 ls -lah "$OUT/reports" | head -40
