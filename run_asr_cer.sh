@@ -35,8 +35,13 @@ echo "=== VE run_asr_cer ==="
 echo "VE_OUT=$VE_OUT"
 echo "ASR 模型目录: $ASR_MODEL_DIR"
 
-"${PYTHON_BIN:-python}" "$ROOT/scripts/asr_cer.py" \
-  --ve-out "$VE_OUT" \
-  --model-dir "$ASR_MODEL_DIR" \
-  --device "${DEVICE:-cuda:0}" \
-  "$@"
+ASR_CLI=(
+  --ve-out "$VE_OUT"
+  --model-dir "$ASR_MODEL_DIR"
+  --device "${DEVICE:-cuda:0}"
+)
+[[ -n "${ASR_LANGUAGE:-}" ]] && ASR_CLI+=(--language "$ASR_LANGUAGE")
+[[ "${ASR_DOMAIN_CONTEXT:-0}" == "1" ]] && ASR_CLI+=(--domain-context)
+[[ "${ASR_RETRY_MISMATCH:-0}" == "1" ]] && ASR_CLI+=(--retry-mismatch)
+
+"${PYTHON_BIN:-python}" "$ROOT/scripts/asr_cer.py" "${ASR_CLI[@]}" "$@"

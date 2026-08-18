@@ -45,6 +45,12 @@ class PresenceResult:
     z_test: float | None = None
     score_norm: str = "raw"
     enroll_vad: dict | None = None
+    cmd_window_mode: str = "off"
+    best_window: dict | None = None
+    second_window: dict | None = None
+    n_windows: int = 0
+    veto_score: float | None = None
+    veto_backend: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -59,7 +65,17 @@ class PresenceResult:
             "n_streams": self.n_streams,
             "sep_wav_dir": self.sep_wav_dir,
             "score_norm": self.score_norm,
+            "cmd_window_mode": self.cmd_window_mode,
+            "n_windows": int(self.n_windows),
         }
+        if self.best_window is not None:
+            d["best_window"] = self.best_window
+        if self.second_window is not None:
+            d["second_window"] = self.second_window
+        if self.veto_score is not None:
+            d["veto_score"] = round(float(self.veto_score), 6)
+        if self.veto_backend:
+            d["veto_backend"] = self.veto_backend
         if self.score_raw is not None:
             d["presence_score_raw"] = round(self.score_raw, 6)
         if self.znorm_mu is not None:
@@ -132,6 +148,14 @@ class PresenceGate:
         score_normalizer: Any | None = None,
         enroll_vad: bool = True,
         enroll_vad_max_sec: float = 4.0,
+        cmd_window_mode: str = "off",
+        win_sec: float = 0.8,
+        hop_sec: float = 0.4,
+        win_pad_ms: float = 80.0,
+        veto_encoder: PresenceEncoder | None = None,
+        veto_margin: float = 0.12,
+        veto_gray: float = 0.10,
+        veto_windows: bool = False,
     ):
         self.encoder = encoder
         self.thr = float(thr)
@@ -151,8 +175,21 @@ class PresenceGate:
         self.max_sep_sec = float(max_sep_sec)
         self.enroll_vad = bool(enroll_vad)
         self.enroll_vad_max_sec = float(enroll_vad_max_sec)
+        self.cmd_window_mode = (cmd_window_mode or "off").lower().strip()
+        if self.cmd_window_mode in ("0", "none", "false", ""):
+            self.cmd_window_mode = "off"
+        if self.cmd_window_mode in ("1", "true", "on", "yes"):
+            self.cmd_window_mode = "slide"
+        self.win_sec = float(win_sec)
+        self.hop_sec = float(hop_sec)
+        self.win_pad_ms = float(win_pad_ms)
+        self.veto_encoder = veto_encoder
+        self.veto_margin = float(veto_margin)
+        self.veto_gray = float(veto_gray)
+        self.veto_windows = bool(veto_windows)
         self._enroll_cache: dict[str, np.ndarray] = {}
         self._enroll_vad_meta: dict[str, dict] = {}
+        self._veto_enroll_cache: dict[str, np.ndarray] = {}
 
         # 归一化：优先 score_normalizer；否则由 enroll/test bank 推断
         if score_normalizer is not None:
@@ -299,8 +336,50 @@ class PresenceGate:
             if s > best:
                 best = s
                 best_stream = name
+
+        best_window: dict | None = None
+        second_window: dict | None = None
+        n_windows = 0
+        mix_wav = streams.get("mix", np.asarray(cmd_wav, dtype=np.float32).reshape(-1))
+        if self.cmd_window_mode != "off":
+            from window_geom import cmd_windows
+
+            wins = cmd_windows(
+                mix_wav,
+                sr,
+                mode=self.cmd_window_mode,
+                win_sec=self.win_sec,
+                hop_sec=self.hop_sec,
+                pad_ms=self.win_pad_ms,
+                min_rms=self.min_stream_rms,
+            )
+            ranked: list[dict[str, Any]] = []
+            segs = [w["wav"] for w in wins]
+            if not segs:
+                segs = [mix_wav]
+                wins = [{"start": 0, "end": int(mix_wav.size), "wav": mix_wav, "sec": mix_wav.size / float(sr)}]
+            embs_w = self.encoder.embed_batch(segs, sr)
+            for winfo, emb_w in zip(wins, embs_w):
+                sc = cosine_sim(e, emb_w)
+                ranked.append({
+                    "start": int(winfo["start"]),
+                    "end": int(winfo["end"]),
+                    "score": float(sc),
+                    "sec": float(winfo.get("sec") or 0.0),
+                })
+            ranked.sort(key=lambda x: -x["score"])
+            n_windows = len(ranked)
+            if ranked:
+                best_window = ranked[0]
+                if len(ranked) > 1:
+                    second_window = ranked[1]
+                # T2：Presence 用 max_window 替换整句/分离 max
+                best = float(best_window["score"])
+                best_stream = "mix_window"
+                sims["mix_window"] = best
+
         score_raw = float(best)
-        t_emb = embs.get(best_stream, e)
+        t_emb = embs.get(best_stream) or embs.get("mix") or e
 
         z_mu = z_sig = z_mu_t = z_sig_t = z_a = z_b = None
         score_norm = "raw"
@@ -319,6 +398,45 @@ class PresenceGate:
             z_a, z_b = nout.z_a, nout.z_b
         reject = score < thr
         reason = "speaker_absent" if reject else ""
+
+        veto_score = None
+        veto_backend = None
+        if (not reject) and self.veto_encoder is not None:
+            from lift_common import camp_veto
+
+            v_key = enroll_key or "__anon__"
+            if v_key not in self._veto_enroll_cache:
+                cropped, _meta = self.prepare_enroll(enroll_wav, sr)
+                self._veto_enroll_cache[v_key] = self.veto_encoder.embed(cropped, sr)
+            ve = self._veto_enroll_cache[v_key]
+            if best_window is not None:
+                i0, i1 = int(best_window["start"]), int(best_window["end"])
+                tgt = mix_wav[i0:i1]
+            else:
+                tgt = streams.get(best_stream, mix_wav)
+            veto_score = cosine_sim(ve, self.veto_encoder.embed(tgt, sr))
+            veto_backend = getattr(self.veto_encoder, "name", "veto")
+            if camp_veto(score, veto_score, thr, gray=self.veto_gray, margin=self.veto_margin):
+                reject = True
+                reason = "camp_veto"
+
+        if (
+            (not reject)
+            and self.veto_windows
+            and best_window is not None
+            and second_window is not None
+        ):
+            from lift_common import window_veto
+
+            if window_veto(
+                best_window.get("score"),
+                second_window.get("score"),
+                thr,
+                gray=self.veto_gray,
+                margin=self.veto_margin,
+            ):
+                reject = True
+                reason = "window_veto"
 
         sep_wav_dir = None
         if save_dir is not None:
@@ -345,6 +463,12 @@ class PresenceGate:
             z_test=z_b,
             score_norm=score_norm,
             enroll_vad=enroll_vad_meta,
+            cmd_window_mode=self.cmd_window_mode,
+            best_window=best_window,
+            second_window=second_window,
+            n_windows=n_windows,
+            veto_score=veto_score,
+            veto_backend=veto_backend,
         )
         return pr, streams, e
 

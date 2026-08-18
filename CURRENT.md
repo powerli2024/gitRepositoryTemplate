@@ -58,4 +58,11 @@ FORCE_CALIB=1 HOLDOUT_FRAC=0.3 \
 - 把 Presence 代理 contest（CER:=FRR）当成提交分
 - 换更大 ASR（P5 搁置）
 
-ASR 下一刀（未过门）：同一 mix 上试强制 `Chinese` / 领域 context；或只对 mix 听砸的难例跑分离轨。见 `PROBLEM.md` P3。
+ASR 下一刀：`./run_next_lift.sh t1|t2|t3|t4`（见 [`EXPERIMENTS.md`](EXPERIMENTS.md) T1–T4）。未过门（真实 contest +0.005）前不改上表默认。
+
+- T1：同一 mix 上 `Chinese` / 领域 context（不用唤醒词）
+- T2：CMD 滑窗 max cosine，ASR 用 argmax 窗
+- T3：时长不匹配才二次解码，回退 mix
+- T4：灰区 camp/次优窗只否决不救援
+
+换更大 ASR（P5）仍搁置。

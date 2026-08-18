@@ -138,6 +138,26 @@ def parse_args() -> argparse.Namespace:
         help="enroll 能量 VAD 裁剪静音后再 embed（默认开）",
     )
     p.add_argument("--enroll-vad-max-sec", type=float, default=4.0)
+    p.add_argument(
+        "--cmd-windows",
+        default="off",
+        help="off | slide | energy：CMD 滑窗/能量段打分；ASR 用 argmax 窗",
+    )
+    p.add_argument("--win-sec", type=float, default=0.8)
+    p.add_argument("--hop-sec", type=float, default=0.4)
+    p.add_argument("--win-pad-ms", type=float, default=80.0)
+    p.add_argument(
+        "--veto-backend",
+        default="",
+        help="灰区第二路否决编码器（如 campplus）；空=关闭。只否决不救援",
+    )
+    p.add_argument("--veto-margin", type=float, default=0.12)
+    p.add_argument("--veto-gray", type=float, default=0.10)
+    p.add_argument(
+        "--veto-windows",
+        action="store_true",
+        help="灰区且次优窗明显低于最优窗时否决",
+    )
     return p.parse_args()
 
 
@@ -280,6 +300,18 @@ def main() -> int:
             eps=float(args.znorm_eps),
         )
 
+    veto_enc = None
+    veto_name = str(getattr(args, "veto_backend", "") or "").strip()
+    if veto_name:
+        veto_enc = create_presence_encoder(
+            veto_name,
+            eres_dir=args.eres_dir or default_eres2net_dir(),
+            resnet_dir=args.spk_chs_dir or default_spk_chs_dir(),
+            campplus_dir=args.eres_dir or default_eres2net_dir(),
+            device=args.device,
+        )
+        print(f"[INFO] veto encoder={veto_enc.name} margin={args.veto_margin}", flush=True)
+
     gate = PresenceGate(
         enc,
         thr=thr_default,
@@ -289,10 +321,19 @@ def main() -> int:
         score_normalizer=score_norm,
         enroll_vad=bool(args.enroll_vad),
         enroll_vad_max_sec=float(args.enroll_vad_max_sec),
+        cmd_window_mode=str(args.cmd_windows or "off"),
+        win_sec=float(args.win_sec),
+        hop_sec=float(args.hop_sec),
+        win_pad_ms=float(args.win_pad_ms),
+        veto_encoder=veto_enc,
+        veto_margin=float(args.veto_margin),
+        veto_gray=float(args.veto_gray),
+        veto_windows=bool(args.veto_windows),
     )
     actual_depth = gate.sep_depth
     print(
-        f"[INFO] enroll_vad={gate.enroll_vad} max_sec={gate.enroll_vad_max_sec}",
+        f"[INFO] enroll_vad={gate.enroll_vad} max_sec={gate.enroll_vad_max_sec} "
+        f"cmd_windows={gate.cmd_window_mode} veto_windows={gate.veto_windows}",
         flush=True,
     )
 
@@ -371,7 +412,7 @@ def main() -> int:
 
             if pr.reject and not args.force_extract:
                 rec["decision"] = "reject"
-                rec["reject_reason"] = "speaker_absent"
+                rec["reject_reason"] = pr.reason or "speaker_absent"
                 rec["extracted_wav"] = None
                 if debug_dir and extractor is not None:
                     try:
@@ -406,6 +447,18 @@ def main() -> int:
                         )
                     else:
                         out, meta = extractor.extract(cmd, enroll, sr=sr)
+                    if pr.best_window and backend == "mix":
+                        from window_geom import crop_with_pad
+
+                        out, wmeta = crop_with_pad(
+                            out,
+                            int(pr.best_window["start"]),
+                            int(pr.best_window["end"]),
+                            sr,
+                            pad_ms=float(args.win_pad_ms),
+                        )
+                        meta = dict(meta or {})
+                        meta["asr_crop"] = wmeta
                     out_path = extracted_dir / split / f"{uid}.wav"
                     save_audio(out_path, out, sr)
                     rec["decision"] = "accept"

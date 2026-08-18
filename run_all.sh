@@ -59,6 +59,13 @@ Presence 门控
   TARGET_FRR          校准辅助目标；默认 0.02
   HOLDOUT_FRAC        >0 时仅在 calib 子集选 thr，并报 holdout contest
                       （建议 0.3；默认 0=同集扫 thr，易乐观）
+  CMD_WINDOWS         off|slide|energy  CMD 滑窗打分；ASR 用 argmax 窗（默认 off）
+                      开了必须 FORCE_CALIB=1（分数几何变了）
+  VETO_CAMP=1         灰区 camp 否决（只加拒）
+  VETO_WINDOWS=1      灰区次优窗否决
+  ASR_LANGUAGE        强制 Qwen3 language（如 Chinese）；空=自动
+  ASR_DOMAIN_CONTEXT=1  智能家居 context，不用唤醒词
+  ASR_RETRY_MISMATCH=1  hyp 与时长不匹配时二次解码，回退 mix
   HOLDOUT_SEED        holdout 随机种子；默认 0
   ASNORM              1=AS-Norm（需 cohort）
   ENROLL_ZNORM        1=仅 enroll Z-Norm
@@ -197,15 +204,30 @@ if [[ "$LANG_SPLIT" == "1" ]]; then LS_TAG=ls; else LS_TAG=gthr; fi
 SCORE_NORM_TAG=raw
 [[ "${ASNORM:-0}" == "1" ]] && SCORE_NORM_TAG=asnorm
 [[ "${ENROLL_ZNORM:-0}" == "1" && "$SCORE_NORM_TAG" == "raw" ]] && SCORE_NORM_TAG=enroll_znorm
+CMD_WINDOWS="${CMD_WINDOWS:-off}"
+case "$(echo "$CMD_WINDOWS" | tr '[:upper:]' '[:lower:]')" in
+  1|true|on|yes|slide) CMD_WINDOWS=slide; WIN_TAG=win ;;
+  energy|vad|seg) CMD_WINDOWS=energy; WIN_TAG=wenergy ;;
+  *) CMD_WINDOWS=off; WIN_TAG=nowin ;;
+esac
+VETO_CAMP="${VETO_CAMP:-0}"
+VETO_WINDOWS="${VETO_WINDOWS:-0}"
 
 if [[ -z "${VE_OUT:-}" || "${VE_OUT}" == "/root/autodl-tmp/ve" ]]; then
   VE_OUT="/root/autodl-tmp/ve_${PIPELINE}_${VAD_TAG}"
+  if [[ "$WIN_TAG" != "nowin" ]]; then
+    VE_OUT="${VE_OUT}_${WIN_TAG}"
+  fi
 fi
 export VE_OUT
 
-# 共享校准目录（多 PIPELINE 对照时只校准一次）；按 backend/sep/lang/vad/norm 分桶
+# 共享校准目录（多 PIPELINE 对照时只校准一次）；按 backend/sep/lang/vad/norm/win 分桶
 CALIB_ROOT="${CALIB_ROOT:-/root/autodl-tmp/ve_presence_best}"
-CALIB_DIR="${CALIB_DIR:-$CALIB_ROOT/reports/presence_calib_${PRESENCE_BACKEND}_${SEP_TAG}_${LS_TAG}_${VAD_TAG}_${SCORE_NORM_TAG}}"
+CALIB_STEM="presence_calib_${PRESENCE_BACKEND}_${SEP_TAG}_${LS_TAG}_${VAD_TAG}_${SCORE_NORM_TAG}"
+if [[ "$WIN_TAG" != "nowin" ]]; then
+  CALIB_STEM="${CALIB_STEM}_${WIN_TAG}"
+fi
+CALIB_DIR="${CALIB_DIR:-$CALIB_ROOT/reports/${CALIB_STEM}}"
 THR_FILE="$CALIB_DIR/recommended_thr.json"
 
 mkdir -p "$VE_OUT"/{manifest,results,extracted,reports,logs}
@@ -293,6 +315,9 @@ else
   [[ "$USE_SEP" == "1" ]] && CAL_ARGS+=(--use-sep --sep-depth 1)
   [[ "$LANG_SPLIT" == "1" ]] && CAL_ARGS+=(--lang-split)
   [[ "$ENROLL_VAD" == "1" ]] && CAL_ARGS+=(--enroll-vad) || CAL_ARGS+=(--no-enroll-vad)
+  if [[ "$CMD_WINDOWS" != "off" ]]; then
+    CAL_ARGS+=(--cmd-windows "$CMD_WINDOWS" --win-sec "${WIN_SEC:-0.8}" --hop-sec "${HOP_SEC:-0.4}")
+  fi
   [[ "$LIMIT" != "0" ]] && CAL_ARGS+=(--limit "$LIMIT")
   if [[ -n "${HOLDOUT_FRAC:-}" && "$HOLDOUT_FRAC" != "0" ]]; then
     CAL_ARGS+=(--holdout-frac "$HOLDOUT_FRAC")
@@ -348,6 +373,13 @@ if [[ "${ASNORM:-0}" == "1" ]]; then
   [[ "$LIMIT" != "0" ]] && EXT_ARGS+=(--limit "$LIMIT")
   [[ -n "${WESEP_MODEL_DIR:-}" ]] && EXT_ARGS+=(--wesep-model-dir "$WESEP_MODEL_DIR")
 fi
+if [[ "$CMD_WINDOWS" != "off" ]]; then
+  EXT_ARGS+=(--cmd-windows "$CMD_WINDOWS" --win-sec "${WIN_SEC:-0.8}" --hop-sec "${HOP_SEC:-0.4}" --win-pad-ms "${WIN_PAD_MS:-80}")
+fi
+if [[ "$VETO_CAMP" == "1" ]]; then
+  EXT_ARGS+=(--veto-backend "${VETO_BACKEND:-campplus}" --veto-margin "${VETO_MARGIN:-0.12}")
+fi
+[[ "$VETO_WINDOWS" == "1" ]] && EXT_ARGS+=(--veto-windows)
 
 echo "[CMD] $PYTHON_BIN $ROOT/scripts/run_extract.py ${EXT_ARGS[*]}"
 echo "[INFO] samples=$SAMPLES thr=$THR_FILE"
@@ -390,6 +422,9 @@ else
   [[ -n "${ASR_MODEL_DIR:-}${QWEN3_ASR_DIR:-}" ]] && \
     ASR_ARGS+=(--model-dir "${ASR_MODEL_DIR:-$QWEN3_ASR_DIR}")
   [[ "$LIMIT" != "0" ]] && ASR_ARGS+=(--limit "$LIMIT")
+  [[ -n "${ASR_LANGUAGE:-}" ]] && ASR_ARGS+=(--language "$ASR_LANGUAGE")
+  [[ "${ASR_DOMAIN_CONTEXT:-0}" == "1" ]] && ASR_ARGS+=(--domain-context)
+  [[ "${ASR_RETRY_MISMATCH:-0}" == "1" ]] && ASR_ARGS+=(--retry-mismatch)
   "$PYTHON_BIN" "$ROOT/scripts/asr_cer.py" "${ASR_ARGS[@]}" \
     || echo "[WARN] asr_cer 失败（可先 ./download_qwen3_asr.sh）；extract 结果仍保留"
 fi

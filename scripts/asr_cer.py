@@ -346,6 +346,39 @@ def fixed_record(sample: dict[str, Any], res: dict[str, Any], status: str,
     return rec
 
 
+def _asr_context(args: argparse.Namespace, sample: dict[str, Any]) -> Optional[str]:
+    raw = getattr(args, "context", None)
+    if raw is not None and str(raw).strip():
+        return str(raw).strip()
+    if getattr(args, "domain_context", False):
+        from lift_common import DOMAIN_CONTEXT
+        return DOMAIN_CONTEXT
+    if getattr(args, "use_wake_context", False):
+        return (sample.get("wake_text") or "").strip() or None
+    return None
+
+
+def _decode_tag(args: argparse.Namespace) -> str:
+    lang = args.language or ("guess" if args.guess_language else "auto")
+    if getattr(args, "context", None) and str(args.context).strip():
+        ctx = "custom"
+    elif getattr(args, "domain_context", False):
+        ctx = "domain"
+    elif getattr(args, "use_wake_context", False):
+        ctx = "wake"
+    else:
+        ctx = "none"
+    retry = "1" if getattr(args, "retry_mismatch", False) else "0"
+    return f"vm-cer-v2|lang={lang}|ctx={ctx}|retry={retry}"
+
+
+def _asr_one(asr: Optional["Qwen3ASRBackend"], wav: str, language: Optional[str],
+             context: Optional[str]) -> str:
+    import librosa
+    audio, _sr = librosa.load(wav, sr=16000)
+    return asr.transcribe_many([audio], language=language, wake_text=context)[0]
+
+
 def process_one(args: argparse.Namespace, sample: dict[str, Any],
                 res: dict[str, Any], wav: str, asr: Optional[Qwen3ASRBackend],
                 norm_ver: str) -> dict[str, Any]:
@@ -354,7 +387,12 @@ def process_one(args: argparse.Namespace, sample: dict[str, Any],
     lang = args.language
     if lang is None and args.guess_language:
         lang = guess_language(sample.get("wake_text"))
-    rec["language"] = lang  # 实际传给 ASR 的 language（None=自动识别）
+    rec["language"] = lang
+    rec["asr_context"] = "domain" if getattr(args, "domain_context", False) else (
+        "wake" if getattr(args, "use_wake_context", False) else (
+            "custom" if (getattr(args, "context", None) or "").strip() else "none"
+        )
+    )
     try:
         import librosa
         rec["dur_sec"] = round(float(librosa.get_duration(path=wav)), 3)
@@ -362,13 +400,39 @@ def process_one(args: argparse.Namespace, sample: dict[str, Any],
         rec["dur_sec"] = None
     t1 = time.time()
     try:
+        ctx = _asr_context(args, sample)
         if args.fake_asr:
             hyp = fake_hyp(str(sample.get("cmd_text") or ""), args.fake_asr)
+            rec["asr_pass"] = "fake"
         else:
-            import librosa
-            wake_ctx = sample.get("wake_text") if args.use_wake_context else None
-            audio, _sr = librosa.load(wav, sr=16000)
-            hyp = asr.transcribe_many([audio], language=lang, wake_text=wake_ctx)[0]
+            from lift_common import DOMAIN_CONTEXT, duration_mismatch
+
+            hyp = _asr_one(asr, wav, lang, ctx)
+            rec["asr_pass"] = "primary"
+            if getattr(args, "retry_mismatch", False) and duration_mismatch(hyp, rec.get("dur_sec")):
+                retry_note: dict[str, Any] = {"reason": "duration_mismatch", "hyp0": hyp}
+                already_domain = (
+                    (lang == "Chinese")
+                    and bool(getattr(args, "domain_context", False))
+                )
+                if not already_domain:
+                    hyp1 = _asr_one(asr, wav, "Chinese", DOMAIN_CONTEXT)
+                    retry_note["hyp1"] = hyp1
+                    if (hyp1 or "").strip():
+                        hyp = hyp1
+                        rec["asr_pass"] = "retry_decode"
+                mix_wav = sample.get("cmd_wav") or res.get("cmd_wav")
+                still = duration_mismatch(hyp, rec.get("dur_sec"))
+                if still and mix_wav and Path(str(mix_wav)).is_file():
+                    mix_p = str(Path(str(mix_wav)).resolve())
+                    cur_p = str(Path(wav).resolve())
+                    if mix_p != cur_p:
+                        hyp2 = _asr_one(asr, mix_p, lang, ctx)
+                        retry_note["hyp_mix"] = hyp2
+                        if (hyp2 or "").strip():
+                            hyp = hyp2
+                            rec["asr_pass"] = "retry_mix"
+                rec["retry"] = retry_note
         rec["asr_ms"] = round((time.time() - t1) * 1000, 1)
         ref = str(sample.get("cmd_text") or "")
         ref_norm = normalize_for_cer(ref)
@@ -390,6 +454,7 @@ def process_one(args: argparse.Namespace, sample: dict[str, Any],
                     "cer": 1.0,
                     "asr_ms": round((time.time() - t1) * 1000, 1)})
     return rec
+
 
 # ------------------------- 统计汇总 -------------------------
 def build_summary(records: list[dict[str, Any]], rr: Optional[float],
@@ -449,6 +514,7 @@ def build_summary(records: list[dict[str, Any]], rr: Optional[float],
         "n_asr_ok": len(ok),
         "n_asr_error_or_empty": len(err),
         "n_cer0_accepted": sum(1 for r in ok if r["cer"] == 0.0),
+        "n_cer1_accepted": sum(1 for r in accepted if (r.get("cer") or 0) >= 1.0),
         "cer_total": total,
         "cer_accepted_mean": accepted_mean,
         "cer_ok_mean": ok_mean,
@@ -476,6 +542,7 @@ def md_summary(s: dict[str, Any]) -> str:
         f"- CER_accepted_mean（仅接受样本真实 CER）= {s['cer_accepted_mean']}",
         f"- CER_ok_mean（ASR 成功且非空转写）= {s['cer_ok_mean']}",
         f"- CER=0 的接受样本数: {s['n_cer0_accepted']}",
+        f"- **CER=1 桶（接受样本）: {s.get('n_cer1_accepted')}**",
         f"- 分位: p50={s['cer_p50']} p90={s['cer_p90']} p95={s['cer_p95']}",
         f"- RR={s['rr']} → 新 contest_score = 0.5*RR + 0.5*(1-CER_total) = {s['contest_score_new']}",
         "",
@@ -517,6 +584,12 @@ def parse_args() -> argparse.Namespace:
                    help="（VM 风格，默认关）按唤醒词推断语言；本数据集唤醒词常与命令语言不一致，默认关闭")
     p.add_argument("--use-wake-context", action="store_true",
                    help="（VM 风格，默认关）把唤醒词作为 context/prompt 传给 ASR；干净评测默认关闭")
+    p.add_argument("--context", default=None,
+                   help="显式 ASR context 字符串；与 --domain-context / --use-wake-context 互斥优先")
+    p.add_argument("--domain-context", action="store_true",
+                   help="使用智能家居领域 context（不用唤醒词）")
+    p.add_argument("--retry-mismatch", action="store_true",
+                   help="hyp 与时长严重不匹配时二次解码（Chinese+领域），再不行回退 mix")
     p.add_argument("--limit", type=int, default=0, help="只跑前 N 条待ASR样本（冒烟）")
     p.add_argument("--resume", action="store_true", default=True,
                    help="跳过已存在于 asr_results.jsonl 且同口径记录（默认开启）")
@@ -528,7 +601,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    norm_ver = "vm-cer-v2"  # v2：默认语言自动识别、不传 context；与 v1 结果不通用
+    norm_ver = _decode_tag(args)
 
     ve_out = (args.ve_out or default_ve_out()).resolve()
     samples_path = (args.samples or ve_out / "manifest" / "samples.jsonl").resolve()
@@ -663,6 +736,8 @@ def main() -> int:
         "model": MODEL_ID, "backend": "qwen-asr", "norm_ver": norm_ver,
         "presence_thr": thr, "rr": rr, "limit": args.limit, "fake_asr": args.fake_asr,
         "dtype": args.dtype, "batch": args.batch, "max_new_tokens": args.max_new_tokens,
+        "language": args.language, "domain_context": bool(args.domain_context),
+        "retry_mismatch": bool(args.retry_mismatch),
         "elapsed_sec": round(time.time() - t0, 2), "ve_out": str(ve_out),
         "n_written": len(ordered),
     }

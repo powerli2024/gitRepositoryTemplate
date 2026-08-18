@@ -35,3 +35,12 @@ $ASR_PROBE_OUT/
 `LIMIT=N` 表示 **pos / neg 各 N 条 utt**。`sep_once` / `sep_multi` 默认不重复转 mix（与 `no_sep` 去重）；若要对齐 Presence 打分臂，加 `--include-mix-in-sep`。
 
 分析看 `analysis.md` / `analysis.json`：pos 的 mix CER vs 分离 oracle（每条 utt 取 min CER，乐观上界）vs 全部轨 pool；neg 的空转写、长度、mix 空但分离轨出字。
+
+下一刀离线验收（锁定门控 + CER=1 桶 + camp 否决）：
+
+```bash
+python asr_probe/scripts/eval_next_lift.py
+# 或仓库根: ./run_next_lift.sh t4
+```
+
+产物默认 `datasetA/sssss/next_lift_eval.json`。T1 另一套转写用 `--alt-asr asr_results.jsonl`。

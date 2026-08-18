@@ -221,6 +221,14 @@ def parse_args() -> argparse.Namespace:
         help=">0 时仅在 (1-frac) 校准子集上选 thr，并在 holdout 上报 contest（防同集过拟合）",
     )
     p.add_argument("--holdout-seed", type=int, default=0)
+    p.add_argument(
+        "--cmd-windows",
+        default="off",
+        help="off | slide | energy：CMD 滑窗打分（须重扫 τ）",
+    )
+    p.add_argument("--win-sec", type=float, default=0.8)
+    p.add_argument("--hop-sec", type=float, default=0.4)
+    p.add_argument("--win-pad-ms", type=float, default=80.0)
     return p.parse_args()
 
 
@@ -304,10 +312,15 @@ def main() -> int:
         score_normalizer=score_norm,
         enroll_vad=bool(args.enroll_vad),
         enroll_vad_max_sec=float(args.enroll_vad_max_sec),
+        cmd_window_mode=str(getattr(args, "cmd_windows", "off") or "off"),
+        win_sec=float(getattr(args, "win_sec", 0.8)),
+        hop_sec=float(getattr(args, "hop_sec", 0.4)),
+        win_pad_ms=float(getattr(args, "win_pad_ms", 80.0)),
     )
     actual_depth = gate.sep_depth
     print(
-        f"[INFO] enroll_vad={gate.enroll_vad} max_sec={gate.enroll_vad_max_sec}",
+        f"[INFO] enroll_vad={gate.enroll_vad} max_sec={gate.enroll_vad_max_sec} "
+        f"cmd_windows={gate.cmd_window_mode}",
         flush=True,
     )
 

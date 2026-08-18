@@ -102,6 +102,59 @@ P5（换 ASR 模型）：不排期。
 
 ---
 
+## T1–T4 下一刀（不改默认，直到真实 contest +0.005）
+
+入口脚本：`./run_next_lift.sh t1|t2|t3|t4`。一次只动一个因子。主看 **CER=1 桶** 与 `contest`，不要优化「啊/吧」粒子。
+
+### T1 — 同一 mix，只改 Qwen3 解码
+
+固定锁定门控与提取波形：
+
+```bash
+VE_OUT=/root/autodl-tmp/ve_mix_novad ./run_next_lift.sh t1
+# 或:
+ASR_LANGUAGE=Chinese ./run_asr_cer.sh --out-dir "$VE_OUT/reports/asr_cer_zh"
+ASR_LANGUAGE=Chinese ASR_DOMAIN_CONTEXT=1 ./run_asr_cer.sh --out-dir "$VE_OUT/reports/asr_cer_zh_domain"
+```
+
+对照：`language=auto`（现状） vs `Chinese` vs `Chinese`+领域 context（**不用唤醒词**）。  
+**Go：** CER=1 接受桶下降且真实 contest ≥ 锁定 +0.005。
+
+### T2 — CMD 滑窗时间选择
+
+Presence = max_window；ASR = argmax 窗（两侧 80ms）。须重扫 τ：
+
+```bash
+./run_next_lift.sh t2
+# 等价:
+ENROLL_VAD=0 PIPELINE=mix CMD_WINDOWS=slide FORCE_CALIB=1 HOLDOUT_FRAC=0.3 ./run_all.sh
+```
+
+与 enroll VAD、盲 TSE 不是同一实验。holdout 上看 contest。
+
+### T3 — 时长不匹配才二次解码
+
+```bash
+VE_OUT=/root/autodl-tmp/ve_mix_novad ./run_next_lift.sh t3
+# 或 ASR_RETRY_MISMATCH=1 ./run_asr_cer.sh --out-dir "$VE_OUT/reports/asr_cer_retry"
+```
+
+先 auto mix；不匹配则 Chinese+领域；若提取已是窗则再回退整段 mix。
+
+### T4 — camp / 次优窗只否决
+
+离线（本地可跑，用 `datasetA/sssss`）：
+
+```bash
+./run_next_lift.sh t4
+# → datasetA/sssss/next_lift_eval.json
+```
+
+接入 extract（过门后）：`VETO_CAMP=1`，可选 `VETO_WINDOWS=1`。与叠话长句加拒合取。禁止救援 FN。  
+**Go：** holdout test Δcontest ≥ 0.005 且额外 pos 误拒 ≤ 5。
+
+---
+
 ## 禁止（与 PROBLEM.md §5 一致）
 
 - 未过门把 `PIPELINE` 默认改成 ps4/wesep/sep_route
